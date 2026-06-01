@@ -62,30 +62,26 @@ class UpstoxClient:
         return r.json()
 
     def load_instruments(self):
-        urls = [f"{BASE_URL}/instruments/NSE_EQ.csv.gz", f"{BASE_URL}/instruments/NSE.csv.gz"]
-        last_err = None
-        for url in urls:
-            try:
-                r = requests.get(url, timeout=30)
-                r.raise_for_status()
-                df = pd.read_csv(pd.io.common.BytesIO(r.content), compression='gzip')
-                cols = {c.lower(): c for c in df.columns}
-                ts_col  = cols.get('trading_symbol') or cols.get('tradingsymbol') or cols.get('symbol')
-                key_col = cols.get('instrument_key') or cols.get('instrumentkey')
-                seg_col = cols.get('segment')
-                if ts_col and key_col:
-                    work = df[[ts_col, key_col] + ([seg_col] if seg_col else [])].copy()
-                    if seg_col:
-                        work = work[work[seg_col].astype(str).str.contains('NSE', na=False)]
-                    for _, row in work.iterrows():
-                        sym = str(row[ts_col])
-                        if sym in FNO_STOCKS:
-                            self.instrument_map[sym] = str(row[key_col])
-                    if self.instrument_map:
-                        return self.instrument_map
-            except Exception as e:
-                last_err = e
-        raise RuntimeError(f"Unable to load instruments: {last_err}")
+        # Upstox BOD instrument JSON — public URL, NO auth header required
+        # CSV format is deprecated; JSON is the recommended format
+        INSTRUMENT_URL = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
+        try:
+            r = requests.get(INSTRUMENT_URL, timeout=60)
+            r.raise_for_status()
+            import json, gzip
+            data = json.loads(gzip.decompress(r.content))
+            for item in data:
+                sym = str(item.get('trading_symbol', ''))
+                seg = str(item.get('segment', ''))
+                itype = str(item.get('instrument_type', ''))
+                key = str(item.get('instrument_key', ''))
+                if sym in FNO_STOCKS and seg == 'NSE_EQ' and itype == 'EQ' and key:
+                    self.instrument_map[sym] = key
+            if self.instrument_map:
+                return self.instrument_map
+            raise RuntimeError("No matching FnO symbols found in instrument file.")
+        except Exception as e:
+            raise RuntimeError(f"Unable to load instruments: {e}")
 
     def get_historical(self, instrument_key: str, interval: str, to_date: str, from_date: str) -> pd.DataFrame:
         url = f"{BASE_URL}/historical-candle/{instrument_key}/{interval}/{to_date}/{from_date}"
