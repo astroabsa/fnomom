@@ -165,13 +165,11 @@ def build_reference_levels(client: UpstoxClient, symbols: List[str]):
 
 # ─── Per-symbol scanner (Calculates 5-minute indicators) ──────────────────────
 def scan_symbol(client: UpstoxClient, sym: str, high15: dict, low15: dict):
-    # Fetch 1-minute data because Upstox API only supports 1minute and 30minute intervals intraday
     df_1m = client.get_candles_today(client.instrument_map[sym], '1minute')
     
     if df_1m.empty or len(df_1m) < 5:
         return None, None
 
-    # Resample 1-minute data into 5-minute candles
     df_1m_idx = df_1m.copy()
     df_1m_idx.set_index('ts', inplace=True)
     df = df_1m_idx.resample('5min').agg({
@@ -250,8 +248,15 @@ def rows_to_df(rows: List[ScannerRow], bullish: bool) -> pd.DataFrame:
     } for r in rows]
     
     df = pd.DataFrame(data)
-    # SORT BY CHG % IN DECREASING ORDER
     return df.sort_values('Chg %', ascending=False)
+
+def get_scored_df(df: pd.DataFrame, target_score: int) -> pd.DataFrame:
+    """Helper to filter rows by the number of matching conditions."""
+    if df.empty:
+        return df
+    # Count checkmarks across condition columns
+    scores = df[['F1', 'F2', 'F3']].apply(lambda x: sum(v == '✅' for v in x), axis=1)
+    return df[scores == target_score]
 
 # ─── Session state init ───────────────────────────────────────────────────────
 for key, default in [
@@ -397,17 +402,41 @@ def style_df(df: pd.DataFrame, bullish: bool) -> pd.DataFrame:
         )
     return out
 
+# --- Bullish Display ---
 st.markdown("### 🟢 Bullish Momentum")
-if bull_df.empty:
-    st.info("No bullish setups currently.")
-else:
-    st.dataframe(style_df(bull_df, True), use_container_width=True, hide_index=True)
+bull_3_cond = get_scored_df(bull_df, 3)
+bull_2_cond = get_scored_df(bull_df, 2)
 
-st.markdown("### 🔴 Bearish Momentum")
-if bear_df.empty:
-    st.info("No bearish setups currently.")
+st.markdown("#### 3 Conditions Met")
+if bull_3_cond.empty:
+    st.info("No stocks currently meet all 3 bullish conditions.")
 else:
-    st.dataframe(style_df(bear_df, False), use_container_width=True, hide_index=True)
+    st.dataframe(style_df(bull_3_cond, True), use_container_width=True, hide_index=True)
+
+st.markdown("#### 2 Conditions Met")
+if bull_2_cond.empty:
+    st.info("No stocks currently meet exactly 2 bullish conditions.")
+else:
+    st.dataframe(style_df(bull_2_cond, True), use_container_width=True, hide_index=True)
+
+st.markdown("---")
+
+# --- Bearish Display ---
+st.markdown("### 🔴 Bearish Momentum")
+bear_3_cond = get_scored_df(bear_df, 3)
+bear_2_cond = get_scored_df(bear_df, 2)
+
+st.markdown("#### 3 Conditions Met")
+if bear_3_cond.empty:
+    st.info("No stocks currently meet all 3 bearish conditions.")
+else:
+    st.dataframe(style_df(bear_3_cond, False), use_container_width=True, hide_index=True)
+
+st.markdown("#### 2 Conditions Met")
+if bear_2_cond.empty:
+    st.info("No stocks currently meet exactly 2 bearish conditions.")
+else:
+    st.dataframe(style_df(bear_2_cond, False), use_container_width=True, hide_index=True)
 
 with st.expander("📋 Scan Log", expanded=False):
     for line in st.session_state.logs[:30]:
