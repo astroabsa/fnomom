@@ -10,7 +10,7 @@ import pytz
 from dataclasses import dataclass
 from typing import List, Optional
 
-st.set_page_config(page_title="FnO Momentum Scanner", layout="wide", page_icon="📈")
+st.set_page_config(page_title="Multi-Timeframe Momentum Scanner", layout="wide", page_icon="📈")
 
 IST = pytz.timezone("Asia/Kolkata")
 BASE_URL = "https://api.upstox.com/v2"
@@ -28,7 +28,7 @@ FNO_STOCKS = [
     'CHOLAFIN','MUTHOOTFIN','SBILIFE','HDFCLIFE','ICICIGI'
 ]
 
-# ─── Token from secrets.toml ─────────────────────────────────────────────────
+# ─── Token ────────────────────────────────────────────────────────────────────
 def get_token() -> str:
     try:
         return st.secrets["upstox"]["access_token"]
@@ -41,18 +41,9 @@ class ScannerRow:
     symbol: str
     ltp: float
     chg_pct: float
-    ref_level: float
-    ema9: Optional[float]
-    ema21: Optional[float]
-    rsi10: Optional[float]
-    rsi_sma14: Optional[float]
-    vwap: Optional[float]
-    oi: Optional[float]
-    f1: bool
-    f2: bool
-    f3: bool
-    f4: bool  # VWAP condition
-    f5: bool  # OI Buildup condition
+    vol_today: float
+    vol_avg_10d: float
+    score: int
     added_at: str
 
 # ─── Upstox API client ────────────────────────────────────────────────────────
@@ -75,26 +66,13 @@ class UpstoxClient:
         r = requests.get(url, timeout=60)
         r.raise_for_status()
         data = json.loads(gzip.decompress(r.content))
-        
-        # Collect futures contracts to find the nearest expiry (Current Month)
-        fut_candidates = {}
         for item in data:
-            sym   = str(item.get('underlying_symbol', '') or item.get('name', ''))
+            sym   = str(item.get('trading_symbol', ''))
             seg   = str(item.get('segment', ''))
             itype = str(item.get('instrument_type', ''))
             key   = str(item.get('instrument_key', ''))
-            expiry = str(item.get('expiry', ''))
-            
-            if sym in FNO_STOCKS and seg == 'NSE_FO' and itype == 'FUT' and key:
-                if sym not in fut_candidates:
-                    fut_candidates[sym] = []
-                fut_candidates[sym].append({'key': key, 'expiry': expiry})
-                
-        for sym, candidates in fut_candidates.items():
-            # Sort by expiry to ensure we always select the current month contract
-            candidates.sort(key=lambda x: str(x['expiry']))
-            self.instrument_map[sym] = candidates[0]['key']
-            
+            if sym in FNO_STOCKS and seg == 'NSE_EQ' and itype == 'EQ' and key:
+                self.instrument_map[sym] = key
         if not self.instrument_map:
             raise RuntimeError("No FnO symbols matched in instrument file.")
         return self.instrument_map
@@ -105,31 +83,28 @@ class UpstoxClient:
         col_names = ['ts','open','high','low','close','volume','oi'][:len(candles[0])]
         df = pd.DataFrame(candles, columns=col_names)
         df['ts'] = pd.to_datetime(df['ts'])
-        for c in ['open','high','low','close','volume','oi']:
+        for c in ['open','high','low','close','volume']:
             if c in df.columns:
                 df[c] = pd.to_numeric(df[c], errors='coerce')
         return df.sort_values('ts').reset_index(drop=True)
 
+    def get_historical(self, instrument_key: str, interval: str, to_date: str, from_date: str) -> pd.DataFrame:
+        url = f"{BASE_URL}/historical-candle/{instrument_key}/{interval}/{to_date}/{from_date}"
+        try:
+            data = self._get(url)
+            return self._candles_to_df(data.get('data', {}).get('candles', []))
+        except Exception:
+            return pd.DataFrame()
+
     def get_intraday(self, instrument_key: str, interval: str = '1minute') -> pd.DataFrame:
         url = f"{BASE_URL}/historical-candle/intraday/{instrument_key}/{interval}"
-        data = self._get(url)
-        return self._candles_to_df(data.get('data', {}).get('candles', []))
+        try:
+            data = self._get(url)
+            return self._candles_to_df(data.get('data', {}).get('candles', []))
+        except Exception:
+            return pd.DataFrame()
 
-    def get_historical(self, instrument_key: str, interval: str,
-                       to_date: str, from_date: str) -> pd.DataFrame:
-        url = f"{BASE_URL}/historical-candle/{instrument_key}/{interval}/{to_date}/{from_date}"
-        data = self._get(url)
-        return self._candles_to_df(data.get('data', {}).get('candles', []))
-
-    def get_candles_today(self, instrument_key: str,
-                          interval: str = '1minute') -> pd.DataFrame:
-        df = self.get_intraday(instrument_key, interval)
-        if not df.empty:
-            return df
-        today = datetime.now(IST).strftime('%Y-%m-%d')
-        return self.get_historical(instrument_key, interval, today, today)
-
-# ─── Technical indicators ─────────────────────────────────────────────────────
+# ─── Indicators ───────────────────────────────────────────────────────────────
 def calc_ema(series: pd.Series, span: int) -> pd.Series:
     return series.ewm(span=span, adjust=False).mean()
 
@@ -142,7 +117,6 @@ def calc_rsi(series: pd.Series, period: int = 10) -> pd.Series:
     rs = avg_gain / avg_loss.replace(0, np.nan)
     return (100 - (100 / (1 + rs))).fillna(0)
 
-# ─── Helpers ──────────────────────────────────────────────────────────────────
 def to_ist(ts_series: pd.Series) -> pd.Series:
     if ts_series.dt.tz is None:
         return ts_series.dt.tz_localize('UTC').dt.tz_convert(IST)
@@ -155,171 +129,158 @@ def market_phase(now_ist: datetime) -> str:
     if t <= dtime(15, 30): return 'Scanning'
     return 'Closed'
 
-# ─── Reference level builder ──────────────────────────────────────────────────
-def build_reference_levels(client: UpstoxClient, symbols: List[str]):
-    high15, low15, logs = {}, {}, []
-    bar = st.progress(0, text='Building 15-minute reference levels...')
+# ─── Caching System ───────────────────────────────────────────────────────────
+def build_historical_cache(client: UpstoxClient, symbols: List[str]):
+    now = datetime.now(IST)
+    today_str = now.strftime('%Y-%m-%d')
+    from_daily_str = (now - pd.Timedelta(days=20)).strftime('%Y-%m-%d')
+    yesterday_str = (now - pd.Timedelta(days=1)).strftime('%Y-%m-%d')
+    from_1m_str = (now - pd.Timedelta(days=6)).strftime('%Y-%m-%d')
+
+    bar = st.progress(0, text='Fetching Historical Data (Daily Volumes & Past Candles)...')
     for i, sym in enumerate(symbols):
-        try:
-            df = client.get_candles_today(client.instrument_map[sym], '1minute')
-            if df.empty:
-                logs.append(f'{sym}: no candle data returned')
-                continue
-            df = df.assign(ts_ist=to_ist(df['ts']))
-            w = df[
-                (df['ts_ist'].dt.time >= dtime(9, 15)) &
-                (df['ts_ist'].dt.time <  dtime(9, 30))
-            ]
-            if w.empty:
-                w = df.head(15)
-                logs.append(f'{sym}: 15-min window empty, used first {len(w)} candles as proxy')
-            high15[sym] = float(w['high'].max())
-            low15[sym]  = float(w['low'].min())
-        except Exception as e:
-            logs.append(f'{sym}: {e}')
-        bar.progress((i + 1) / len(symbols), text=f'Reference levels: {i+1}/{len(symbols)}')
-    bar.empty()
-    return high15, low15, logs
-
-# ─── Per-symbol scanner (Calculates 5-minute indicators) ──────────────────────
-def scan_symbol(client: UpstoxClient, sym: str, high15: dict, low15: dict):
-    df_1m = client.get_candles_today(client.instrument_map[sym], '1minute')
-    
-    if df_1m.empty or len(df_1m) < 5:
-        return None, None
-
-    # Resample 1-minute data into 5-minute candles, adding Volume and OI aggregation
-    df_1m_idx = df_1m.copy()
-    df_1m_idx.set_index('ts', inplace=True)
-    
-    agg_dict = {
-        'open': 'first',
-        'high': 'max',
-        'low': 'min',
-        'close': 'last',
-        'volume': 'sum'
-    }
-    if 'oi' in df_1m_idx.columns:
-        agg_dict['oi'] = 'last'
+        key = client.instrument_map[sym]
         
-    df = df_1m_idx.resample('5min').agg(agg_dict).dropna(subset=['close']).reset_index()
+        # 1. Get 10-day average volume
+        df_daily = client.get_historical(key, 'day', today_str, from_daily_str)
+        if not df_daily.empty:
+            df_daily['ts_ist'] = to_ist(df_daily['ts'])
+            df_daily = df_daily[df_daily['ts_ist'].dt.date < now.date()]
+            avg_vol = df_daily['volume'].tail(10).mean() if len(df_daily) >= 10 else df_daily['volume'].mean()
+            st.session_state.daily_vols[sym] = avg_vol
+        else:
+            st.session_state.daily_vols[sym] = 0
 
-    if df.empty or len(df) < 5:
+        # 2. Get past 5 days of 1-min data for accurate RSI & EMA seeding
+        df_1m_hist = client.get_historical(key, '1minute', yesterday_str, from_1m_str)
+        st.session_state.hist_1m[sym] = df_1m_hist
+
+        bar.progress((i + 1) / len(symbols))
+        time.sleep(0.01)
+    bar.empty()
+
+# ─── Per-symbol Scanner ───────────────────────────────────────────────────────
+def scan_symbol(client: UpstoxClient, sym: str):
+    key = client.instrument_map[sym]
+    
+    # 1. Fetch live intraday 1-min data
+    df_live = client.get_intraday(key, '1minute')
+    if df_live.empty:
+        return None, None
+        
+    df_live['ts'] = to_ist(df_live['ts'])
+    today_vol = float(df_live['volume'].sum())
+    avg_vol_10d = st.session_state.daily_vols.get(sym, 0)
+
+    # 2. Extract today's first 15m high/low
+    morning_mask = (df_live['ts'].dt.time >= dtime(9, 15)) & (df_live['ts'].dt.time < dtime(9, 30))
+    morning_df = df_live[morning_mask]
+    high15 = morning_df['high'].max() if not morning_df.empty else np.inf
+    low15 = morning_df['low'].min() if not morning_df.empty else -np.inf
+
+    # 3. Stitch live data with cached history
+    df_hist = st.session_state.hist_1m.get(sym, pd.DataFrame())
+    if not df_hist.empty and df_hist['ts'].dt.tz is None:
+        df_hist['ts'] = to_ist(df_hist['ts'])
+        
+    df_all = pd.concat([df_hist, df_live]).drop_duplicates(subset='ts').sort_values('ts')
+    df_all.set_index('ts', inplace=True)
+
+    if df_all.empty:
         return None, None
 
-    close = df['close']
+    # 4. Generate 5-min timeframe (EMA & VWAP)
+    df_5m = df_all.resample('5min').agg({
+        'open':'first', 'high':'max', 'low':'min', 'close':'last', 'volume':'sum'
+    }).dropna()
     
-    # Calculate Indicators
-    df['ema9']      = calc_ema(close, 9)
-    df['ema21']     = calc_ema(close, 21)
-    df['rsi10']     = calc_rsi(close, 10)
-    df['rsi_sma14'] = df['rsi10'].rolling(14).mean()
+    df_5m['ema9'] = calc_ema(df_5m['close'], 9)
+    df_5m['ema21'] = calc_ema(df_5m['close'], 21)
     
-    # Calculate VWAP
-    df['typical_price'] = (df['high'] + df['low'] + df['close']) / 3
-    df['vwap'] = (df['typical_price'] * df['volume']).cumsum() / df['volume'].cumsum()
+    df_5m['date'] = df_5m.index.date
+    df_5m['typical'] = (df_5m['high'] + df_5m['low'] + df_5m['close']) / 3
+    df_5m['vwap'] = (df_5m['typical'] * df_5m['volume']).groupby(df_5m['date']).cumsum() / df_5m['volume'].groupby(df_5m['date']).cumsum()
 
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
-    prev_close = float(prev['close']) if pd.notna(prev['close']) else float(last['close'])
-    chg_pct = ((float(last['close']) - prev_close) / prev_close * 100) if prev_close else 0
+    # 5. Generate 15-min timeframe (RSI)
+    df_15m = df_all.resample('15min').agg({'close':'last'}).dropna()
+    df_15m['rsi10'] = calc_rsi(df_15m['close'], 10)
+    df_15m['rsi_sma14'] = df_15m['rsi10'].rolling(14).mean()
 
-    ts_raw = pd.to_datetime(last['ts'])
-    ts = ts_raw.tz_localize('UTC').tz_convert(IST) if ts_raw.tzinfo is None else ts_raw.tz_convert(IST)
-    ts_str = ts.strftime('%H:%M')
+    # 6. Evaluate latest conditions
+    last_5m = df_5m.iloc[-1]
+    prev_5m = df_5m.iloc[-2] if len(df_5m) > 1 else last_5m
+    last_15m = df_15m.iloc[-1]
 
-    e9, e21   = last['ema9'], last['ema21']
-    r10, rsma = last['rsi10'], last['rsi_sma14']
-    vwap_val  = last['vwap']
+    close = float(last_5m['close'])
+    prev_close = float(prev_5m['close'])
+    chg_pct = ((close - prev_close) / prev_close * 100) if prev_close else 0
     
-    has_ema   = pd.notna(e9)  and pd.notna(e21)
-    has_rsi   = pd.notna(r10) and pd.notna(rsma)
-    has_vwap  = pd.notna(vwap_val)
-    
-    # OI Buildup Condition: OI higher than it was 15 mins ago (3 candles back)
-    has_oi = 'oi' in df.columns and pd.notna(df['oi'].iloc[-1])
-    oi_val = df['oi'].iloc[-1] if has_oi else None
-    
-    if has_oi and len(df) >= 3:
-        oi_prev3 = df['oi'].iloc[-3]
-        oi_increasing = float(oi_val) > float(oi_prev3)
-    else:
-        oi_increasing = False
+    e9 = last_5m['ema9']
+    e21 = last_5m['ema21']
+    vwap = last_5m['vwap']
+    rsi = last_15m['rsi10']
+    sma = last_15m['rsi_sma14']
+    ts_str = df_5m.index[-1].strftime('%H:%M')
 
-    def make_row(ref, f2, f3, f4, f5):
-        return ScannerRow(
-            symbol=sym, ltp=float(last['close']), chg_pct=float(chg_pct),
-            ref_level=ref,
-            ema9      = float(e9)   if pd.notna(e9)   else None,
-            ema21     = float(e21)  if pd.notna(e21)  else None,
-            rsi10     = float(r10)  if pd.notna(r10)  else None,
-            rsi_sma14 = float(rsma) if pd.notna(rsma) else None,
-            vwap      = float(vwap_val) if pd.notna(vwap_val) else None,
-            oi        = float(oi_val) if pd.notna(oi_val) else None,
-            f1=True, f2=f2, f3=f3, f4=f4, f5=f5, added_at=ts_str
-        )
+    # Calculate Bullish Score (+1 per condition)
+    bull_score = sum([
+        bool(close > high15),
+        bool(e9 > e21) if pd.notna(e9) and pd.notna(e21) else False,
+        bool(rsi > sma) if pd.notna(rsi) and pd.notna(sma) else False,
+        bool(today_vol > avg_vol_10d),
+        bool(close > vwap) if pd.notna(vwap) else False
+    ])
 
-    bull = make_row(float(high15[sym]),
-                    bool(e9 > e21)   if has_ema else False,
-                    bool(r10 > rsma) if has_rsi else False,
-                    bool(last['close'] > vwap_val) if has_vwap else False,
-                    bool(oi_increasing)) \
-           if float(last['close']) > high15.get(sym, np.inf) else None
+    # Calculate Bearish Score (+1 per condition)
+    bear_score = sum([
+        bool(close < low15),
+        bool(e9 < e21) if pd.notna(e9) and pd.notna(e21) else False,
+        bool(rsi < sma) if pd.notna(rsi) and pd.notna(sma) else False,
+        bool(today_vol > avg_vol_10d),
+        bool(close < vwap) if pd.notna(vwap) else False
+    ])
 
-    bear = make_row(float(low15[sym]),
-                    bool(e9 < e21)   if has_ema else False,
-                    bool(r10 < rsma) if has_rsi else False,
-                    bool(last['close'] < vwap_val) if has_vwap else False,
-                    bool(oi_increasing)) \
-           if float(last['close']) < low15.get(sym, -np.inf) else None
+    bull = ScannerRow(
+        symbol=sym, ltp=close, chg_pct=chg_pct,
+        vol_today=today_vol, vol_avg_10d=avg_vol_10d,
+        score=bull_score, added_at=ts_str
+    ) if bull_score >= 2 else None
+
+    bear = ScannerRow(
+        symbol=sym, ltp=close, chg_pct=chg_pct,
+        vol_today=today_vol, vol_avg_10d=avg_vol_10d,
+        score=bear_score, added_at=ts_str
+    ) if bear_score >= 2 else None
 
     return bull, bear
 
-# ─── DataFrame builder ────────────────────────────────────────────────────────
-def rows_to_df(rows: List[ScannerRow], bullish: bool) -> pd.DataFrame:
-    ref_col = '15m High' if bullish else '15m Low'
-    cols = ['Symbol','LTP','Chg %', ref_col,
-            'EMA9','EMA21','RSI10','RSI SMA14','VWAP','OI','F1','F2','F3','F4','F5','Time']
+# ─── DataFrame Formatting ─────────────────────────────────────────────────────
+def rows_to_df(rows: List[ScannerRow]) -> pd.DataFrame:
+    cols = ['Symbol', 'LTP', 'Chg %', 'Score', 'Vol Today', '10D Avg Vol', 'Time']
     if not rows:
         return pd.DataFrame(columns=cols)
+        
     data = [{
-        'Symbol':  r.symbol,
-        'LTP':     round(r.ltp, 2),
-        'Chg %':   round(r.chg_pct, 2),
-        ref_col:   round(r.ref_level, 2),
-        'EMA9':    round(r.ema9, 2)      if r.ema9      else None,
-        'EMA21':   round(r.ema21, 2)     if r.ema21     else None,
-        'RSI10':   round(r.rsi10, 2)     if r.rsi10     else None,
-        'RSI SMA14': round(r.rsi_sma14, 2) if r.rsi_sma14 else None,
-        'VWAP':    round(r.vwap, 2)      if r.vwap      else None,
-        'OI':      round(r.oi, 0)        if r.oi        else None,
-        'F1': '✅' if r.f1 else '—',
-        'F2': '✅' if r.f2 else '—',
-        'F3': '✅' if r.f3 else '—',
-        'F4': '✅' if r.f4 else '—',
-        'F5': '✅' if r.f5 else '—',
+        'Symbol': r.symbol,
+        'LTP': f"₹{r.ltp:.2f}",
+        'Chg %': f"{'+' if r.chg_pct >= 0 else ''}{r.chg_pct:.2f}%",
+        'Score': f"{r.score} / 5",
+        'Vol Today': f"{int(r.vol_today):,}",
+        '10D Avg Vol': f"{int(r.vol_avg_10d):,}",
         'Time': r.added_at,
+        '_raw_score': r.score,
+        '_raw_chg': r.chg_pct
     } for r in rows]
     
-    df = pd.DataFrame(data)
-    return df.sort_values('Chg %', ascending=False)
+    # Sort primarily by raw Score descending, secondarily by Chg % descending
+    df = pd.DataFrame(data).sort_values(['_raw_score', '_raw_chg'], ascending=[False, False])
+    return df.drop(columns=['_raw_score', '_raw_chg'])
 
-def get_scored_df(df: pd.DataFrame, target_score: int) -> pd.DataFrame:
-    """Helper to filter rows by the number of matching conditions."""
-    if df.empty:
-        return df
-    # Count checkmarks across all condition columns
-    scores = df[['F1', 'F2', 'F3', 'F4', 'F5']].apply(lambda x: sum(v == '✅' for v in x), axis=1)
-    return df[scores == target_score]
-
-# ─── Session state init ───────────────────────────────────────────────────────
+# ─── Session State ────────────────────────────────────────────────────────────
 for key, default in [
-    ('logs', []),
-    ('high15', {}), ('low15', {}),
-    ('instrument_map', {}),
-    ('bull_rows', []), ('bear_rows', []),
-    ('last_scan', None),
-    ('scan_count', 0),
+    ('logs', []), ('daily_vols', {}), ('hist_1m', {}),
+    ('instrument_map', {}), ('bull_rows', []), ('bear_rows', []),
+    ('last_scan', None), ('scan_count', 0), ('cache_built', False)
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -328,178 +289,107 @@ for key, default in [
 st.markdown("""
 <style>
 .block-container {padding-top: 1.1rem; padding-bottom: 0.5rem; max-width: 97%;}
-[data-testid='stMetric'] {
-    background: #0f172a; border: 1px solid #1e293b;
-    padding: 12px 16px; border-radius: 12px;
-}
+[data-testid='stMetric'] { background: #0f172a; border: 1px solid #1e293b; padding: 12px 16px; border-radius: 12px; }
 [data-testid='stMetricLabel'] {font-size: 12px; color: #94a3b8;}
 [data-testid='stMetricValue'] {font-size: 20px; font-weight: 700;}
-.stDataFrame thead tr th {
-    font-size: 12px !important;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-}
-.stDataFrame tbody tr td {
-    font-size: 13px !important;
-    font-variant-numeric: tabular-nums;
-}
+.stDataFrame thead tr th { font-size: 12px !important; text-transform: uppercase; letter-spacing: 0.04em; }
+.stDataFrame tbody tr td { font-size: 13px !important; font-variant-numeric: tabular-nums; }
 </style>
 """, unsafe_allow_html=True)
 
-# ─── Header ───────────────────────────────────────────────────────────────────
-st.markdown("## 📈 FnO Momentum Scanner (Futures)")
-st.caption("Upstox 5-min scanner · F1: 15m Breakout | F2: EMA9/21 | F3: RSI/SMA | F4: VWAP | F5: OI Buildup")
+# ─── Header & Auth ────────────────────────────────────────────────────────────
+st.markdown("## 📈 Multi-Timeframe Momentum Scanner (Scored)")
+st.caption("Scoring out of 5: 15m Breakout (+1) · 5m EMA9>21 (+1) · 15m RSI>SMA (+1) · Vol > 10D Avg (+1) · 5m VWAP (+1)")
 
-# ─── Auth Verification ────────────────────────────────────────────────────────
 access_token = get_token()
 if not access_token or access_token == "YOUR_UPSTOX_ACCESS_TOKEN_HERE":
     st.error("🔑 Access token missing. Please add it to `.streamlit/secrets.toml`.")
-    st.code('''# .streamlit/secrets.toml\n[upstox]\naccess_token = "your_token_here"''', language="toml")
     st.stop()
 
-# ─── Instrument loading ───────────────────────────────────────────────────────
 client = UpstoxClient(access_token)
 
+# ─── Build Cache ──────────────────────────────────────────────────────────────
 if not st.session_state.instrument_map:
-    with st.spinner("Loading Futures instrument master from Upstox…"):
+    with st.spinner("Loading NSE_EQ instrument master..."):
         try:
             st.session_state.instrument_map = client.load_instruments()
-            st.session_state.logs.insert(0, f"Futures loaded: {len(st.session_state.instrument_map)}")
         except Exception as e:
             st.error(f"Instrument load failed: {e}")
             st.stop()
-
 client.instrument_map = st.session_state.instrument_map
 symbols = [s for s in FNO_STOCKS if s in client.instrument_map]
 
-# ─── Auto-Build Reference Levels ──────────────────────────────────────────────
-if not st.session_state.high15:
-    with st.status("Building 15-minute reference levels…", expanded=True) as status_box:
-        try:
-            h15, l15, ref_logs = build_reference_levels(client, symbols)
-            if h15:
-                st.session_state.high15 = h15
-                st.session_state.low15  = l15
-                st.session_state.logs   = ([f"✅ Reference levels ready for {len(h15)} symbols"] + ref_logs[:15])
-                status_box.update(label=f"✅ Reference levels built for {len(h15)} symbols", state="complete")
-            else:
-                status_box.update(label="⚠️ No reference levels built — see logs below", state="error")
-                for line in ref_logs[:10]:
-                    st.caption(line)
-                st.stop()
-        except Exception as e:
-            status_box.update(label=f"Reference build failed: {e}", state="error")
-            st.stop()
+if not st.session_state.cache_built:
+    build_historical_cache(client, symbols)
+    st.session_state.cache_built = True
 
-# ─── Run scan ─────────────────────────────────────────────────────────────────
+# ─── Scanner Loop ─────────────────────────────────────────────────────────────
 def do_scan():
     bull_rows, bear_rows, scan_logs = [], [], []
-    bar = st.progress(0, text="Scanning symbols…")
+    bar = st.progress(0, text="Running Intraday Scan…")
     for i, sym in enumerate(symbols):
         try:
-            bull, bear = scan_symbol(
-                client, sym,
-                st.session_state.high15,
-                st.session_state.low15
-            )
+            bull, bear = scan_symbol(client, sym)
             if bull: bull_rows.append(bull)
             if bear: bear_rows.append(bear)
         except Exception as e:
             scan_logs.append(f"{sym}: {e}")
-        bar.progress((i + 1) / len(symbols), text=f"Scanning {sym}  ({i+1}/{len(symbols)})")
-        time.sleep(0.02)
+        bar.progress((i + 1) / len(symbols))
+        time.sleep(0.01)
     bar.empty()
+    
     now = datetime.now(IST)
-    st.session_state.bull_rows   = bull_rows
-    st.session_state.bear_rows   = bear_rows
-    st.session_state.last_scan   = now.strftime('%H:%M:%S')
+    st.session_state.bull_rows = bull_rows
+    st.session_state.bear_rows = bear_rows
+    st.session_state.last_scan = now.strftime('%H:%M:%S')
     st.session_state.scan_count += 1
-    st.session_state.logs = [
-        f"[{now.strftime('%H:%M:%S')}] Scan #{st.session_state.scan_count} complete",
-        f"  Bullish setups : {len(bull_rows)}",
-        f"  Bearish setups : {len(bear_rows)}",
-    ] + scan_logs[:20]
+    st.session_state.logs = [f"[{now.strftime('%H:%M:%S')}] Scan #{st.session_state.scan_count} complete"] + scan_logs[:20]
 
-# Automatically trigger scan
 do_scan()
 
-# ─── Status bar ───────────────────────────────────────────────────────────────
-now_ist  = datetime.now(IST)
-phase    = market_phase(now_ist)
+# ─── Status Bar ───────────────────────────────────────────────────────────────
+now_ist = datetime.now(IST)
+phase = market_phase(now_ist)
 
-h1,h2,h3,h4 = st.columns(4)
-with h1: st.metric("Phase",       phase)
-with h2: st.metric("IST Time",    now_ist.strftime('%H:%M:%S'))
-with h3: st.metric("Scans Run",   st.session_state.scan_count)
-with h4: st.metric("Last Scan",   st.session_state.last_scan or "—")
+h1, h2, h3, h4 = st.columns(4)
+with h1: st.metric("Market Phase", phase)
+with h2: st.metric("IST Time", now_ist.strftime('%H:%M:%S'))
+with h3: st.metric("Scans Run", st.session_state.scan_count)
+with h4: st.metric("Last Scan", st.session_state.last_scan or "—")
 
 # ─── Tables ───────────────────────────────────────────────────────────────────
-bull_df = rows_to_df(st.session_state.bull_rows, bullish=True)
-bear_df = rows_to_df(st.session_state.bear_rows, bullish=False)
+bull_df = rows_to_df(st.session_state.bull_rows)
+bear_df = rows_to_df(st.session_state.bear_rows)
 
-def style_df(df: pd.DataFrame, bullish: bool) -> pd.DataFrame:
-    if df.empty:
-        return df
-    out = df.copy()
-    ref_col = '15m High' if bullish else '15m Low'
-    for col, fmt in [('LTP','₹{:.2f}'), (ref_col,'₹{:.2f}'), ('VWAP','₹{:.2f}'),
-                     ('EMA9','{:.2f}'), ('EMA21','{:.2f}'),
-                     ('RSI10','{:.1f}'), ('RSI SMA14','{:.1f}'),
-                     ('OI', '{:.0f}')]:
-        if col in out.columns:
-            out[col] = out[col].apply(
-                lambda v: fmt.format(v) if pd.notna(v) and isinstance(v, (int,float)) else '—'
-            )
-    if 'Chg %' in out.columns:
-        out['Chg %'] = out['Chg %'].apply(
-            lambda v: ('+' if v >= 0 else '') + f'{v:.2f}%'
-            if pd.notna(v) and isinstance(v, (int,float)) else '—'
-        )
-    return out
+def render_scored_tables(df: pd.DataFrame, title: str, is_bullish: bool):
+    st.markdown(f"### {'🟢' if is_bullish else '🔴'} {title}")
+    
+    df_5 = df[df['Score'] == '5 / 5'] if not df.empty else pd.DataFrame()
+    df_4 = df[df['Score'] == '4 / 5'] if not df.empty else pd.DataFrame()
+    
+    st.markdown("#### Perfect Setups (Score: 5 / 5)")
+    if df_5.empty:
+        st.info("No setups currently with a perfect 5 / 5 score.")
+    else:
+        st.dataframe(df_5, use_container_width=True, hide_index=True)
 
-# --- Bullish Display ---
-st.markdown("### 🟢 Bullish Momentum")
-bull_5_cond = get_scored_df(bull_df, 5)
-bull_4_cond = get_scored_df(bull_df, 4)
+    st.markdown("#### Strong Setups (Score: 4 / 5)")
+    if df_4.empty:
+        st.info("No setups currently with a 4 / 5 score.")
+    else:
+        st.dataframe(df_4, use_container_width=True, hide_index=True)
 
-st.markdown("#### Perfect Setup (5/5 Conditions Met)")
-if bull_5_cond.empty:
-    st.info("No stocks currently meet all 5 bullish conditions.")
-else:
-    st.dataframe(style_df(bull_5_cond, True), use_container_width=True, hide_index=True)
-
-st.markdown("#### Strong Setup (4/5 Conditions Met)")
-if bull_4_cond.empty:
-    st.info("No stocks currently meet exactly 4 bullish conditions.")
-else:
-    st.dataframe(style_df(bull_4_cond, True), use_container_width=True, hide_index=True)
-
+render_scored_tables(bull_df, "Bullish Momentum", True)
 st.markdown("---")
-
-# --- Bearish Display ---
-st.markdown("### 🔴 Bearish Momentum")
-bear_5_cond = get_scored_df(bear_df, 5)
-bear_4_cond = get_scored_df(bear_df, 4)
-
-st.markdown("#### Perfect Setup (5/5 Conditions Met)")
-if bear_5_cond.empty:
-    st.info("No stocks currently meet all 5 bearish conditions.")
-else:
-    st.dataframe(style_df(bear_5_cond, False), use_container_width=True, hide_index=True)
-
-st.markdown("#### Strong Setup (4/5 Conditions Met)")
-if bear_4_cond.empty:
-    st.info("No stocks currently meet exactly 4 bearish conditions.")
-else:
-    st.dataframe(style_df(bear_4_cond, False), use_container_width=True, hide_index=True)
+render_scored_tables(bear_df, "Bearish Momentum", False)
 
 with st.expander("📋 Scan Log", expanded=False):
     for line in st.session_state.logs[:30]:
         st.caption(line)
 
-# ─── Auto refresh ─────────────────────────────────────────────────────────────
+# ─── Auto Refresh ─────────────────────────────────────────────────────────────
 if phase not in ('Scanning', 'Monitoring'):
-    st.warning(f"Market is **{phase}**. Scanner will still refresh every 60s.")
+    st.warning(f"Market is **{phase}**. Scanner will wait for market hours.")
 
 placeholder = st.empty()
 for remaining in range(60, 0, -1):
