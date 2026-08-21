@@ -163,10 +163,24 @@ def build_reference_levels(client: UpstoxClient, symbols: List[str]):
     bar.empty()
     return high15, low15, logs
 
-# ─── Per-symbol scanner (5-minute timeframe) ──────────────────────────────────
+# ─── Per-symbol scanner (Calculates 5-minute indicators) ──────────────────────
 def scan_symbol(client: UpstoxClient, sym: str, high15: dict, low15: dict):
-    # CHANGED TO 5MINUTE FOR INDICATORS
-    df = client.get_candles_today(client.instrument_map[sym], '5minute')
+    # Fetch 1-minute data because Upstox API only supports 1minute and 30minute intervals intraday
+    df_1m = client.get_candles_today(client.instrument_map[sym], '1minute')
+    
+    if df_1m.empty or len(df_1m) < 5:
+        return None, None
+
+    # Resample 1-minute data into 5-minute candles
+    df_1m_idx = df_1m.copy()
+    df_1m_idx.set_index('ts', inplace=True)
+    df = df_1m_idx.resample('5min').agg({
+        'open': 'first',
+        'high': 'max',
+        'low': 'min',
+        'close': 'last'
+    }).dropna(subset=['close']).reset_index()
+
     if df.empty or len(df) < 5:
         return None, None
 
