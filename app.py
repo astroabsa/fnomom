@@ -82,7 +82,10 @@ class UpstoxClient:
             return pd.DataFrame(columns=['ts','open','high','low','close','volume','oi'])
         col_names = ['ts','open','high','low','close','volume','oi'][:len(candles[0])]
         df = pd.DataFrame(candles, columns=col_names)
-        df['ts'] = pd.to_datetime(df['ts'])
+        
+        # Ensure strict UTC datetime conversion upfront
+        df['ts'] = pd.to_datetime(df['ts'], utc=True)
+        
         for c in ['open','high','low','close','volume']:
             if c in df.columns:
                 df[c] = pd.to_numeric(df[c], errors='coerce')
@@ -117,11 +120,6 @@ def calc_rsi(series: pd.Series, period: int = 10) -> pd.Series:
     rs = avg_gain / avg_loss.replace(0, np.nan)
     return (100 - (100 / (1 + rs))).fillna(0)
 
-def to_ist(ts_series: pd.Series) -> pd.Series:
-    if ts_series.dt.tz is None:
-        return ts_series.dt.tz_localize('UTC').dt.tz_convert(IST)
-    return ts_series.dt.tz_convert(IST)
-
 def market_phase(now_ist: datetime) -> str:
     t = now_ist.time()
     if t < dtime(9, 15):   return 'Pre-Open'
@@ -144,15 +142,18 @@ def build_historical_cache(client: UpstoxClient, symbols: List[str]):
         # 1. Get 10-day average volume
         df_daily = client.get_historical(key, 'day', today_str, from_daily_str)
         if not df_daily.empty:
-            df_daily['ts_ist'] = to_ist(df_daily['ts'])
+            df_daily['ts_ist'] = df_daily['ts'].dt.tz_convert(IST)
             df_daily = df_daily[df_daily['ts_ist'].dt.date < now.date()]
             avg_vol = df_daily['volume'].tail(10).mean() if len(df_daily) >= 10 else df_daily['volume'].mean()
             st.session_state.daily_vols[sym] = avg_vol
         else:
             st.session_state.daily_vols[sym] = 0
 
-        # 2. Get past 5 days of 1-min data for accurate RSI & EMA seeding
+        # 2. Get past 5 days of 1-min data
         df_1m_hist = client.get_historical(key, '1minute', yesterday_str, from_1m_str)
+        if not df_1m_hist.empty:
+            # Convert timezone to IST explicitly
+            df_1m_hist['ts'] = df_1m_hist['ts'].dt.tz_convert(IST)
         st.session_state.hist_1m[sym] = df_1m_hist
 
         bar.progress((i + 1) / len(symbols))
@@ -168,7 +169,9 @@ def scan_symbol(client: UpstoxClient, sym: str):
     if df_live.empty:
         return None, None
         
-    df_live['ts'] = to_ist(df_live['ts'])
+    # Convert live data timezone to IST
+    df_live['ts'] = df_live['ts'].dt.tz_convert(IST)
+    
     today_vol = float(df_live['volume'].sum())
     avg_vol_10d = st.session_state.daily_vols.get(sym, 0)
 
@@ -178,12 +181,12 @@ def scan_symbol(client: UpstoxClient, sym: str):
     high15 = morning_df['high'].max() if not morning_df.empty else np.inf
     low15 = morning_df['low'].min() if not morning_df.empty else -np.inf
 
-    # 3. Stitch live data with cached history
+    # 3. Stitch live data with cached history safely
     df_hist = st.session_state.hist_1m.get(sym, pd.DataFrame())
-    if not df_hist.empty and df_hist['ts'].dt.tz is None:
-        df_hist['ts'] = to_ist(df_hist['ts'])
-        
     df_all = pd.concat([df_hist, df_live]).drop_duplicates(subset='ts').sort_values('ts')
+    
+    # Explicitly enforce DatetimeIndex to prevent resampling crashes
+    df_all['ts'] = pd.to_datetime(df_all['ts'], utc=True).dt.tz_convert(IST)
     df_all.set_index('ts', inplace=True)
 
     if df_all.empty:
@@ -201,9 +204,10 @@ def scan_symbol(client: UpstoxClient, sym: str):
     df_5m['typical'] = (df_5m['high'] + df_5m['low'] + df_5m['close']) / 3
     df_5m['vwap'] = (df_5m['typical'] * df_5m['volume']).groupby(df_5m['date']).cumsum() / df_5m['volume'].groupby(df_5m['date']).cumsum()
 
-    # 5. Generate 15-min timeframe (RSI)
+    # 5. Generate 15-min timeframe (RSI10 & RSI14)
     df_15m = df_all.resample('15min').agg({'close':'last'}).dropna()
     df_15m['rsi10'] = calc_rsi(df_15m['close'], 10)
+    df_15m['rsi14'] = calc_rsi(df_15m['close'], 14)
     df_15m['rsi_sma14'] = df_15m['rsi10'].rolling(14).mean()
 
     # 6. Evaluate latest conditions
@@ -218,15 +222,18 @@ def scan_symbol(client: UpstoxClient, sym: str):
     e9 = last_5m['ema9']
     e21 = last_5m['ema21']
     vwap = last_5m['vwap']
-    rsi = last_15m['rsi10']
+    rsi10 = last_15m['rsi10']
+    rsi14 = last_15m['rsi14']
     sma = last_15m['rsi_sma14']
     ts_str = df_5m.index[-1].strftime('%H:%M')
+    
+    rsi_valid = pd.notna(rsi10) and pd.notna(rsi14) and pd.notna(sma)
 
     # Calculate Bullish Score (+1 per condition)
     bull_score = sum([
         bool(close > high15),
         bool(e9 > e21) if pd.notna(e9) and pd.notna(e21) else False,
-        bool(rsi > sma) if pd.notna(rsi) and pd.notna(sma) else False,
+        bool(rsi14 > 50 and rsi10 > sma) if rsi_valid else False,
         bool(today_vol > avg_vol_10d),
         bool(close > vwap) if pd.notna(vwap) else False
     ])
@@ -235,7 +242,7 @@ def scan_symbol(client: UpstoxClient, sym: str):
     bear_score = sum([
         bool(close < low15),
         bool(e9 < e21) if pd.notna(e9) and pd.notna(e21) else False,
-        bool(rsi < sma) if pd.notna(rsi) and pd.notna(sma) else False,
+        bool(rsi14 < 50 and rsi10 < sma) if rsi_valid else False,
         bool(today_vol > avg_vol_10d),
         bool(close < vwap) if pd.notna(vwap) else False
     ])
@@ -272,7 +279,6 @@ def rows_to_df(rows: List[ScannerRow]) -> pd.DataFrame:
         '_raw_chg': r.chg_pct
     } for r in rows]
     
-    # Sort primarily by raw Score descending, secondarily by Chg % descending
     df = pd.DataFrame(data).sort_values(['_raw_score', '_raw_chg'], ascending=[False, False])
     return df.drop(columns=['_raw_score', '_raw_chg'])
 
@@ -299,7 +305,7 @@ st.markdown("""
 
 # ─── Header & Auth ────────────────────────────────────────────────────────────
 st.markdown("## 📈 Multi-Timeframe Momentum Scanner (Scored)")
-st.caption("Scoring out of 5: 15m Breakout (+1) · 5m EMA9>21 (+1) · 15m RSI>SMA (+1) · Vol > 10D Avg (+1) · 5m VWAP (+1)")
+st.caption("Scoring out of 5: 15m Breakout · 5m EMA9>21 · 15m RSI>SMA · Vol > 10D Avg · 5m VWAP")
 
 access_token = get_token()
 if not access_token or access_token == "YOUR_UPSTOX_ACCESS_TOKEN_HERE":
