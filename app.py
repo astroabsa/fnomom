@@ -46,9 +46,11 @@ class ScannerRow:
     ema21: Optional[float]
     rsi10: Optional[float]
     rsi_sma14: Optional[float]
+    vwap: Optional[float]
     f1: bool
     f2: bool
     f3: bool
+    f4: bool  # VWAP condition
     added_at: str
 
 # ─── Upstox API client ────────────────────────────────────────────────────────
@@ -88,7 +90,7 @@ class UpstoxClient:
         col_names = ['ts','open','high','low','close','volume','oi'][:len(candles[0])]
         df = pd.DataFrame(candles, columns=col_names)
         df['ts'] = pd.to_datetime(df['ts'])
-        for c in ['open','high','low','close']:
+        for c in ['open','high','low','close','volume']:
             df[c] = pd.to_numeric(df[c], errors='coerce')
         return df.sort_values('ts').reset_index(drop=True)
 
@@ -170,23 +172,31 @@ def scan_symbol(client: UpstoxClient, sym: str, high15: dict, low15: dict):
     if df_1m.empty or len(df_1m) < 5:
         return None, None
 
+    # Resample 1-minute data into 5-minute candles, adding Volume aggregation
     df_1m_idx = df_1m.copy()
     df_1m_idx.set_index('ts', inplace=True)
     df = df_1m_idx.resample('5min').agg({
         'open': 'first',
         'high': 'max',
         'low': 'min',
-        'close': 'last'
+        'close': 'last',
+        'volume': 'sum'
     }).dropna(subset=['close']).reset_index()
 
     if df.empty or len(df) < 5:
         return None, None
 
     close = df['close']
+    
+    # Calculate Indicators
     df['ema9']      = calc_ema(close, 9)
     df['ema21']     = calc_ema(close, 21)
     df['rsi10']     = calc_rsi(close, 10)
     df['rsi_sma14'] = df['rsi10'].rolling(14).mean()
+    
+    # Calculate VWAP
+    df['typical_price'] = (df['high'] + df['low'] + df['close']) / 3
+    df['vwap'] = (df['typical_price'] * df['volume']).cumsum() / df['volume'].cumsum()
 
     last = df.iloc[-1]
     prev = df.iloc[-2]
@@ -199,10 +209,13 @@ def scan_symbol(client: UpstoxClient, sym: str, high15: dict, low15: dict):
 
     e9, e21   = last['ema9'], last['ema21']
     r10, rsma = last['rsi10'], last['rsi_sma14']
+    vwap_val  = last['vwap']
+    
     has_ema   = pd.notna(e9)  and pd.notna(e21)
     has_rsi   = pd.notna(r10) and pd.notna(rsma)
+    has_vwap  = pd.notna(vwap_val)
 
-    def make_row(ref, f2, f3):
+    def make_row(ref, f2, f3, f4):
         return ScannerRow(
             symbol=sym, ltp=float(last['close']), chg_pct=float(chg_pct),
             ref_level=ref,
@@ -210,17 +223,20 @@ def scan_symbol(client: UpstoxClient, sym: str, high15: dict, low15: dict):
             ema21     = float(e21)  if pd.notna(e21)  else None,
             rsi10     = float(r10)  if pd.notna(r10)  else None,
             rsi_sma14 = float(rsma) if pd.notna(rsma) else None,
-            f1=True, f2=f2, f3=f3, added_at=ts_str
+            vwap      = float(vwap_val) if pd.notna(vwap_val) else None,
+            f1=True, f2=f2, f3=f3, f4=f4, added_at=ts_str
         )
 
     bull = make_row(float(high15[sym]),
                     bool(e9 > e21)   if has_ema else False,
-                    bool(r10 > rsma) if has_rsi else False) \
+                    bool(r10 > rsma) if has_rsi else False,
+                    bool(last['close'] > vwap_val) if has_vwap else False) \
            if float(last['close']) > high15.get(sym, np.inf) else None
 
     bear = make_row(float(low15[sym]),
                     bool(e9 < e21)   if has_ema else False,
-                    bool(r10 < rsma) if has_rsi else False) \
+                    bool(r10 < rsma) if has_rsi else False,
+                    bool(last['close'] < vwap_val) if has_vwap else False) \
            if float(last['close']) < low15.get(sym, -np.inf) else None
 
     return bull, bear
@@ -229,7 +245,7 @@ def scan_symbol(client: UpstoxClient, sym: str, high15: dict, low15: dict):
 def rows_to_df(rows: List[ScannerRow], bullish: bool) -> pd.DataFrame:
     ref_col = '15m High' if bullish else '15m Low'
     cols = ['Symbol','LTP','Chg %', ref_col,
-            'EMA9','EMA21','RSI10','RSI SMA14','F1','F2','F3','Time']
+            'EMA9','EMA21','RSI10','RSI SMA14','VWAP','F1','F2','F3','F4','Time']
     if not rows:
         return pd.DataFrame(columns=cols)
     data = [{
@@ -241,9 +257,11 @@ def rows_to_df(rows: List[ScannerRow], bullish: bool) -> pd.DataFrame:
         'EMA21':   round(r.ema21, 2)     if r.ema21     else None,
         'RSI10':   round(r.rsi10, 2)     if r.rsi10     else None,
         'RSI SMA14': round(r.rsi_sma14, 2) if r.rsi_sma14 else None,
+        'VWAP':    round(r.vwap, 2)      if r.vwap      else None,
         'F1': '✅' if r.f1 else '—',
         'F2': '✅' if r.f2 else '—',
         'F3': '✅' if r.f3 else '—',
+        'F4': '✅' if r.f4 else '—',
         'Time': r.added_at,
     } for r in rows]
     
@@ -254,8 +272,8 @@ def get_scored_df(df: pd.DataFrame, target_score: int) -> pd.DataFrame:
     """Helper to filter rows by the number of matching conditions."""
     if df.empty:
         return df
-    # Count checkmarks across condition columns
-    scores = df[['F1', 'F2', 'F3']].apply(lambda x: sum(v == '✅' for v in x), axis=1)
+    # Count checkmarks across all condition columns
+    scores = df[['F1', 'F2', 'F3', 'F4']].apply(lambda x: sum(v == '✅' for v in x), axis=1)
     return df[scores == target_score]
 
 # ─── Session state init ───────────────────────────────────────────────────────
@@ -294,7 +312,7 @@ st.markdown("""
 
 # ─── Header ───────────────────────────────────────────────────────────────────
 st.markdown("## 📈 FnO Momentum Scanner")
-st.caption("Upstox 5-minute indicator scanner · EMA9/21 · RSI10/SMA14 · First 15-min breakout")
+st.caption("Upstox 5-min scanner · F1: 15m Breakout | F2: EMA9/21 | F3: RSI/SMA | F4: VWAP")
 
 # ─── Auth Verification ────────────────────────────────────────────────────────
 access_token = get_token()
@@ -388,7 +406,7 @@ def style_df(df: pd.DataFrame, bullish: bool) -> pd.DataFrame:
         return df
     out = df.copy()
     ref_col = '15m High' if bullish else '15m Low'
-    for col, fmt in [('LTP','₹{:.2f}'), (ref_col,'₹{:.2f}'),
+    for col, fmt in [('LTP','₹{:.2f}'), (ref_col,'₹{:.2f}'), ('VWAP','₹{:.2f}'),
                      ('EMA9','{:.2f}'), ('EMA21','{:.2f}'),
                      ('RSI10','{:.1f}'), ('RSI SMA14','{:.1f}')]:
         if col in out.columns:
@@ -404,39 +422,39 @@ def style_df(df: pd.DataFrame, bullish: bool) -> pd.DataFrame:
 
 # --- Bullish Display ---
 st.markdown("### 🟢 Bullish Momentum")
+bull_4_cond = get_scored_df(bull_df, 4)
 bull_3_cond = get_scored_df(bull_df, 3)
-bull_2_cond = get_scored_df(bull_df, 2)
 
-st.markdown("#### 3 Conditions Met")
+st.markdown("#### Perfect Setup (4/4 Conditions Met)")
+if bull_4_cond.empty:
+    st.info("No stocks currently meet all 4 bullish conditions.")
+else:
+    st.dataframe(style_df(bull_4_cond, True), use_container_width=True, hide_index=True)
+
+st.markdown("#### Strong Setup (3/4 Conditions Met)")
 if bull_3_cond.empty:
-    st.info("No stocks currently meet all 3 bullish conditions.")
+    st.info("No stocks currently meet exactly 3 bullish conditions.")
 else:
     st.dataframe(style_df(bull_3_cond, True), use_container_width=True, hide_index=True)
-
-st.markdown("#### 2 Conditions Met")
-if bull_2_cond.empty:
-    st.info("No stocks currently meet exactly 2 bullish conditions.")
-else:
-    st.dataframe(style_df(bull_2_cond, True), use_container_width=True, hide_index=True)
 
 st.markdown("---")
 
 # --- Bearish Display ---
 st.markdown("### 🔴 Bearish Momentum")
+bear_4_cond = get_scored_df(bear_df, 4)
 bear_3_cond = get_scored_df(bear_df, 3)
-bear_2_cond = get_scored_df(bear_df, 2)
 
-st.markdown("#### 3 Conditions Met")
+st.markdown("#### Perfect Setup (4/4 Conditions Met)")
+if bear_4_cond.empty:
+    st.info("No stocks currently meet all 4 bearish conditions.")
+else:
+    st.dataframe(style_df(bear_4_cond, False), use_container_width=True, hide_index=True)
+
+st.markdown("#### Strong Setup (3/4 Conditions Met)")
 if bear_3_cond.empty:
-    st.info("No stocks currently meet all 3 bearish conditions.")
+    st.info("No stocks currently meet exactly 3 bearish conditions.")
 else:
     st.dataframe(style_df(bear_3_cond, False), use_container_width=True, hide_index=True)
-
-st.markdown("#### 2 Conditions Met")
-if bear_2_cond.empty:
-    st.info("No stocks currently meet exactly 2 bearish conditions.")
-else:
-    st.dataframe(style_df(bear_2_cond, False), use_container_width=True, hide_index=True)
 
 with st.expander("📋 Scan Log", expanded=False):
     for line in st.session_state.logs[:30]:
